@@ -3,12 +3,14 @@ use bevy_panorbit_camera::{PanOrbitCamera, PanOrbitCameraPlugin};
 
 mod heightmap;
 mod mesh_builder;
+mod tectonics;
 mod terrain_noise;
 
 use mesh_builder::heightmap_to_mesh;
+use tectonics::{apply_tectonics, TectonicParams};
 use terrain_noise::{generate_fbm, FbmParams};
 
-const GRID: usize = 128;
+const GRID: usize = 256;
 const WORLD_SIZE: f32 = 100.0;
 const HEIGHT_SCALE: f32 = 1.0;
 
@@ -25,12 +27,13 @@ fn setup(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    // Multi-octave fBm Perlin base: believable large-scale terrain shape.
-    let hm = generate_fbm(
+    // Pipeline: fBm base -> tectonic uplift + ridge guidance.
+    let base = generate_fbm(
         GRID,
         GRID,
-        &FbmParams { amplitude: 18.0, ..Default::default() },
+        &FbmParams { amplitude: 10.0, ..Default::default() },
     );
+    let hm = apply_tectonics(&base, &TectonicParams::default());
     let mesh = heightmap_to_mesh(&hm, WORLD_SIZE, HEIGHT_SCALE);
 
     commands.spawn((
