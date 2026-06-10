@@ -3,9 +3,10 @@ use bevy_panorbit_camera::{PanOrbitCamera, PanOrbitCameraPlugin};
 
 mod heightmap;
 mod mesh_builder;
+mod terrain_noise;
 
-use heightmap::Heightmap;
 use mesh_builder::heightmap_to_mesh;
+use terrain_noise::{generate_fbm, FbmParams};
 
 const GRID: usize = 128;
 const WORLD_SIZE: f32 = 100.0;
@@ -24,14 +25,12 @@ fn setup(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    // Trivial placeholder heightmap: two crossed cosine waves -> a gentle hill
-    // field, just to prove generation -> mesh -> render. Real noise is Phase 2.
-    let hm = Heightmap::from_fn(GRID, GRID, |x, z| {
-        let fx = x as f32 / (GRID - 1) as f32;
-        let fz = z as f32 / (GRID - 1) as f32;
-        let h = (fx * std::f32::consts::TAU).cos() + (fz * std::f32::consts::TAU).cos();
-        h * 6.0
-    });
+    // Multi-octave fBm Perlin base: believable large-scale terrain shape.
+    let hm = generate_fbm(
+        GRID,
+        GRID,
+        &FbmParams { amplitude: 18.0, ..Default::default() },
+    );
     let mesh = heightmap_to_mesh(&hm, WORLD_SIZE, HEIGHT_SCALE);
 
     commands.spawn((
