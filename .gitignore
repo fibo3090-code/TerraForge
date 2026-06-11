@@ -7,3 +7,4 @@
 
 # Cargo.lock IS committed: terraforge is a binary application, so we want
 # reproducible builds from a pinned dependency graph.
+test_output/

@@ -43,12 +43,63 @@ pub fn heightmap_to_mesh(hm: &Heightmap, world_size: f32, height_scale: f32) -> 
     }
 
     let normals = compute_normals(&positions, &indices);
+    let colors = slope_height_colors(&positions, &normals);
 
     Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
         .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
         .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
         .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
         .with_inserted_indices(Indices::U32(indices))
+}
+
+/// Per-vertex RGBA shading band. Pure presentation — no effect on the
+/// simulation. Three regions blended by elevation, then a steepness mask
+/// pushes any slope above ~25° toward rock so erosion channels read clearly:
+///   - low (h < 0.30):  meadow / dry grass
+///   - mid (h ~ 0.55):  dirt
+///   - high (h > 0.80): rock, with snow above the snow line on gentle faces
+fn slope_height_colors(positions: &[[f32; 3]], normals: &[[f32; 3]]) -> Vec<[f32; 4]> {
+    let (mut y_min, mut y_max) = (f32::INFINITY, f32::NEG_INFINITY);
+    for p in positions {
+        y_min = y_min.min(p[1]);
+        y_max = y_max.max(p[1]);
+    }
+    let y_range = (y_max - y_min).max(1e-6);
+
+    let grass = Vec3::new(0.36, 0.42, 0.22);
+    let dirt = Vec3::new(0.52, 0.42, 0.28);
+    let rock = Vec3::new(0.48, 0.43, 0.39);
+    let snow = Vec3::new(0.96, 0.97, 1.00);
+
+    positions
+        .iter()
+        .zip(normals)
+        .map(|(p, n)| {
+            let h = ((p[1] - y_min) / y_range).clamp(0.0, 1.0);
+            // Smooth elevation band: grass -> dirt -> rock.
+            let low_to_mid = smoothstep(0.18, 0.45, h);
+            let mid_to_high = smoothstep(0.55, 0.82, h);
+            let elev = grass.lerp(dirt, low_to_mid).lerp(rock, mid_to_high);
+
+            // Slope steepness in [0,1]: 0 = flat, 1 = vertical face.
+            let steepness = (1.0 - n[1]).clamp(0.0, 1.0);
+            // Anything above 25°-ish reads as exposed rock.
+            let rock_blend = smoothstep(0.18, 0.55, steepness);
+            let base = elev.lerp(rock, rock_blend);
+
+            // Snow on gentle high ground only.
+            let snow_t = smoothstep(0.62, 0.92, h) * (1.0 - smoothstep(0.10, 0.35, steepness));
+            let c = base.lerp(snow, snow_t);
+            [c.x, c.y, c.z, 1.0]
+        })
+        .collect()
+}
+
+#[inline]
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 /// Area-weighted vertex normals from face normals.
