@@ -1,9 +1,12 @@
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::light::{CascadeShadowConfigBuilder, DirectionalLightShadowMap, GlobalAmbientLight};
+use bevy::pbr::MaterialPlugin;
 use bevy::prelude::*;
+use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 use bevy_panorbit_camera::{PanOrbitCamera, PanOrbitCameraPlugin};
 
 mod analysis;
+mod biome;
 mod erosion;
 mod heightmap;
 mod mesh_builder;
@@ -11,6 +14,7 @@ mod talus;
 mod tectonics;
 mod terrain_noise;
 
+use biome::{build_terrain_material, BiomeParams, TerrainMaterial};
 use mesh_builder::heightmap_to_mesh;
 use tectonics::{apply_tectonics, TectonicParams};
 use terrain_noise::{generate_fbm, FbmParams};
@@ -25,9 +29,20 @@ const EROSION_ITERATIONS: u32 = (GRID as u32 * 3) / 4;
 const TALUS_ANGLE_DEG: f32 = 35.0;
 const TALUS_ITERATIONS: u32 = 12;
 
+/// Optional capture mode: when `TERRAFORGE_CAPTURE=path/to/out.png` is set,
+/// the app renders a few frames, screenshots the primary window to that path,
+/// and exits. Used by the verification harness to feed the *real* GPU render
+/// into the streak / colour-distribution analysers.
+#[derive(Resource)]
+struct CaptureMode {
+    output_path: String,
+    frames_waited: u32,
+    triggered: bool,
+}
+
 fn main() {
-    App::new()
-        .insert_resource(ClearColor(Color::srgb(0.55, 0.68, 0.82)))
+    let mut app = App::new();
+    app.insert_resource(ClearColor(Color::srgb(0.55, 0.68, 0.82)))
         .insert_resource(GlobalAmbientLight {
             color: Color::srgb(0.75, 0.82, 0.95),
             brightness: 2500.0,
@@ -36,14 +51,50 @@ fn main() {
         .insert_resource(DirectionalLightShadowMap { size: 4096 })
         .add_plugins(DefaultPlugins)
         .add_plugins(PanOrbitCameraPlugin)
-        .add_systems(Startup, setup)
-        .run();
+        .add_plugins(MaterialPlugin::<TerrainMaterial>::default())
+        .add_systems(Startup, setup);
+
+    if let Ok(path) = std::env::var("TERRAFORGE_CAPTURE") {
+        app.insert_resource(CaptureMode {
+            output_path: path,
+            frames_waited: 0,
+            triggered: false,
+        });
+        app.add_systems(Update, capture_then_exit);
+    }
+    app.run();
+}
+
+/// Wait long enough for the material to compile + a few frames to settle,
+/// then take a screenshot and request app exit on the following frame.
+fn capture_then_exit(
+    mut commands: Commands,
+    mut capture: ResMut<CaptureMode>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    capture.frames_waited += 1;
+    // Step 1: take the screenshot after ~120 frames (covers material compile,
+    // texture upload, and one stable render).
+    if !capture.triggered && capture.frames_waited >= 120 {
+        info!("capture: writing screenshot to {}", capture.output_path);
+        commands.spawn(Screenshot::primary_window())
+            .observe(save_to_disk(capture.output_path.clone()));
+        capture.triggered = true;
+    }
+    // Step 2: once triggered, give the screenshot system a few frames to
+    // finish writing to disk, then exit cleanly.
+    if capture.triggered && capture.frames_waited >= 150 {
+        info!("capture: exiting");
+        exit.write(AppExit::Success);
+    }
 }
 
 fn setup(
     mut commands: Commands,
+    asset_server: Res<AssetServer>,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut materials: ResMut<Assets<TerrainMaterial>>,
+    mut images: ResMut<Assets<Image>>,
 ) {
     // Pipeline: fBm base -> tectonic uplift + ridges -> GPU hydraulic
     // erosion -> CPU talus relaxation -> mesh.
@@ -113,15 +164,17 @@ fn setup(
     let mesh = heightmap_to_mesh(&hm, WORLD_SIZE, HEIGHT_SCALE);
     info!("mesh build ({} verts): {:?}", GRID * GRID, t.elapsed());
 
+    // Biome material reads the post-erosion height range so the elevation
+    // smoothsteps line up with this seed's actual relief.
+    let biome_params = BiomeParams {
+        world_y_min: h_min,
+        world_y_range: (h_max - h_min).max(1e-3),
+        ..Default::default()
+    };
+    let terrain_mat = build_terrain_material(&asset_server, &mut materials, &mut images, biome_params);
     commands.spawn((
         Mesh3d(meshes.add(mesh)),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            // White base lets the per-vertex slope/height colours show through.
-            base_color: Color::WHITE,
-            perceptual_roughness: 0.92,
-            reflectance: 0.05,
-            ..default()
-        })),
+        MeshMaterial3d(terrain_mat),
     ));
 
     // Warm sun + cascaded shadows that actually frame the terrain extent.
@@ -142,12 +195,21 @@ fn setup(
         .build(),
     ));
 
-    // Fly-around (orbit) camera with MSAA and tone mapping.
+    // Fly-around (orbit) camera with MSAA and tone mapping. Capture mode
+    // forces a close-up perspective looking down a slope — that's where
+    // shader streak artifacts are loudest, so the autonomous capture has
+    // the best chance of catching them.
+    let (cam_pos, cam_target) = if std::env::var("TERRAFORGE_CAPTURE").is_ok() {
+        // Close-up: sit just above the surface, look down a slope.
+        (Vec3::new(15.0, h_max as f32 + 8.0, 15.0), Vec3::new(-25.0, h_mean as f32, -25.0))
+    } else {
+        (Vec3::new(0.0, 70.0, 130.0), Vec3::ZERO)
+    };
     commands.spawn((
         Camera3d::default(),
         Msaa::Sample4,
         Tonemapping::TonyMcMapface,
-        Transform::from_xyz(0.0, 70.0, 130.0).looking_at(Vec3::ZERO, Vec3::Y),
+        Transform::from_xyz(cam_pos.x, cam_pos.y, cam_pos.z).looking_at(cam_target, Vec3::Y),
         PanOrbitCamera::default(),
     ));
 }

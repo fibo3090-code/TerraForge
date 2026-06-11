@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-bevy = "0.18"
+bevy = { version = "0.18", features = ["jpeg"] }
 bevy_panorbit_camera = "0.34"
 bytemuck = { version = "1", features = ["derive"] }
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 noise = "0.9"
 pollster = "0.4"
 wgpu = "27"
