@@ -1,6 +1,12 @@
+use bevy::anti_alias::fxaa::Fxaa;
+use bevy::camera::Exposure;
 use bevy::core_pipeline::tonemapping::Tonemapping;
-use bevy::light::{CascadeShadowConfigBuilder, DirectionalLightShadowMap, GlobalAmbientLight};
-use bevy::pbr::MaterialPlugin;
+use bevy::light::{
+    light_consts::lux, AtmosphereEnvironmentMapLight, CascadeShadowConfigBuilder,
+    DirectionalLightShadowMap, GlobalAmbientLight, NotShadowCaster,
+};
+use bevy::pbr::{Atmosphere, AtmosphereSettings, MaterialPlugin, ScatteringMedium};
+use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 use bevy_panorbit_camera::{PanOrbitCamera, PanOrbitCameraPlugin};
@@ -42,12 +48,10 @@ struct CaptureMode {
 
 fn main() {
     let mut app = App::new();
-    app.insert_resource(ClearColor(Color::srgb(0.55, 0.68, 0.82)))
-        .insert_resource(GlobalAmbientLight {
-            color: Color::srgb(0.75, 0.82, 0.95),
-            brightness: 2500.0,
-            ..default()
-        })
+    // Sky + ambient both come from the atmosphere now: the render-sky node
+    // draws the background and AtmosphereEnvironmentMapLight supplies the
+    // sky-bounce IBL, so the flat clear colour and hand-tuned ambient go.
+    app.insert_resource(GlobalAmbientLight::NONE)
         .insert_resource(DirectionalLightShadowMap { size: 4096 })
         .add_plugins(DefaultPlugins)
         .add_plugins(PanOrbitCameraPlugin)
@@ -94,7 +98,9 @@ fn setup(
     asset_server: Res<AssetServer>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<TerrainMaterial>>,
+    mut std_materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
+    mut scattering_mediums: ResMut<Assets<ScatteringMedium>>,
 ) {
     // Pipeline: fBm base -> tectonic uplift + ridges -> GPU hydraulic
     // erosion -> CPU talus relaxation -> mesh.
@@ -177,11 +183,33 @@ fn setup(
         MeshMaterial3d(terrain_mat),
     ));
 
-    // Warm sun + cascaded shadows that actually frame the terrain extent.
+    // Water plane: floods the lowest valleys. Sea level is derived from this
+    // seed's stats rather than hard-coded so re-tuning erosion never leaves
+    // the water floating above (or buried under) the terrain.
+    let water_level = h_min + 0.12 * (h_max - h_min);
+    commands.spawn((
+        // 20x the terrain so the plane's edge stays beyond the horizon line
+        // from any sane orbit position.
+        Mesh3d(meshes.add(Plane3d::default().mesh().size(WORLD_SIZE * 20.0, WORLD_SIZE * 20.0))),
+        MeshMaterial3d(std_materials.add(StandardMaterial {
+            base_color: Color::srgba(0.08, 0.22, 0.32, 0.9),
+            perceptual_roughness: 0.08,
+            metallic: 0.0,
+            reflectance: 0.4,
+            alpha_mode: AlphaMode::Blend,
+            ..default()
+        })),
+        Transform::from_xyz(0.0, water_level, 0.0),
+        NotShadowCaster,
+    ));
+    info!("water plane at y={water_level:.2}");
+
+    // Sun at physical illuminance — the atmosphere LUTs expect real-world
+    // lux, and the camera's Exposure(ev100=13) brings it back to display
+    // range. Cascaded shadows sized to the terrain extent.
     commands.spawn((
         DirectionalLight {
-            color: Color::srgb(1.0, 0.96, 0.88),
-            illuminance: 11_000.0,
+            illuminance: lux::RAW_SUNLIGHT,
             shadows_enabled: true,
             ..default()
         },
@@ -199,16 +227,37 @@ fn setup(
     // forces a close-up perspective looking down a slope — that's where
     // shader streak artifacts are loudest, so the autonomous capture has
     // the best chance of catching them.
+    // Capture viewpoints: "close" (default) frames a slope where texture
+    // artifacts are loudest; "wide" frames the whole terrain + horizon so sky
+    // and water coverage can be verified. Always capture BOTH when validating
+    // a visual change — artifacts hide at the viewpoint you didn't check.
+    let view = std::env::var("TERRAFORGE_CAPTURE_VIEW").unwrap_or_default();
     let (cam_pos, cam_target) = if std::env::var("TERRAFORGE_CAPTURE").is_ok() {
-        // Close-up: sit just above the surface, look down a slope.
-        (Vec3::new(15.0, h_max as f32 + 8.0, 15.0), Vec3::new(-25.0, h_mean as f32, -25.0))
+        if view == "wide" {
+            (Vec3::new(0.0, 55.0, 150.0), Vec3::new(0.0, 5.0, 0.0))
+        } else {
+            (Vec3::new(15.0, h_max as f32 + 8.0, 15.0), Vec3::new(-25.0, h_mean as f32, -25.0))
+        }
     } else {
         (Vec3::new(0.0, 70.0, 130.0), Vec3::ZERO)
     };
     commands.spawn((
         Camera3d::default(),
-        Msaa::Sample4,
-        Tonemapping::TonyMcMapface,
+        // Physically-based sky + aerial perspective. scene_units_to_m = 20
+        // reads the 100-unit terrain as a ~2 km massif: enough air for subtle
+        // haze on far ridges without fogging the whole scene (100 here put
+        // ~15 km between the orbit camera and the terrain and washed it out).
+        Atmosphere::earthlike(scattering_mediums.add(ScatteringMedium::default())),
+        AtmosphereSettings { scene_units_to_m: 20.0, ..default() },
+        // Sky-driven ambient + reflections for this view.
+        AtmosphereEnvironmentMapLight::default(),
+        Exposure { ev100: 13.0 },
+        Bloom::NATURAL,
+        // The atmosphere render-sky node is incompatible with MSAA; the
+        // upstream example pairs it with FXAA instead.
+        Msaa::Off,
+        Fxaa::default(),
+        Tonemapping::AcesFitted,
         Transform::from_xyz(cam_pos.x, cam_pos.y, cam_pos.z).looking_at(cam_target, Vec3::Y),
         PanOrbitCamera::default(),
     ));
