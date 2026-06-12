@@ -5,7 +5,8 @@ edition = "2021"
 
 [dependencies]
 bevy = { version = "0.18", features = ["jpeg"] }
-bevy_panorbit_camera = "0.34"
+bevy_egui = "0.39.1"
+bevy_panorbit_camera = { version = "0.34", features = ["bevy_egui"] }
 bytemuck = { version = "1", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 noise = "0.9"
