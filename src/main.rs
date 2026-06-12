@@ -1,8 +1,11 @@
+#![allow(clippy::too_many_arguments)] // Bevy systems take their deps as params
+
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
 use bevy::anti_alias::fxaa::Fxaa;
 use bevy::camera::Exposure;
+use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::light::{
     light_consts::lux, AtmosphereEnvironmentMapLight, CascadeShadowConfigBuilder,
@@ -149,6 +152,21 @@ struct ExportInFlight {
     last_result: Option<Result<String, String>>,
 }
 
+/// Accessibility / UI preferences.
+#[derive(Resource)]
+struct UiPrefs {
+    /// egui pixels-per-point multiplier (text + widget size).
+    scale: f32,
+    /// F1 toggles the whole panel for an unobstructed view.
+    visible: bool,
+}
+
+impl Default for UiPrefs {
+    fn default() -> Self {
+        Self { scale: 1.0, visible: true }
+    }
+}
+
 #[derive(Component)]
 struct WaterPlane;
 
@@ -180,7 +198,9 @@ fn main() {
         .insert_resource(LastRunInfo::default())
         .insert_resource(LastAudit::default())
         .insert_resource(ExportInFlight::default())
+        .insert_resource(UiPrefs::default())
         .add_plugins(DefaultPlugins)
+        .add_plugins(FrameTimeDiagnosticsPlugin::default())
         .add_plugins(EguiPlugin::default())
         .add_plugins(PanOrbitCameraPlugin)
         .add_plugins(MaterialPlugin::<TerrainMaterial>::default())
@@ -232,6 +252,7 @@ fn setup(
     asset_server: Res<AssetServer>,
     params: Res<PipelineParamsRes>,
     visual: Res<VisualParams>,
+    mut regen: ResMut<RegenRequested>,
     mut cache: ResMut<PipelineCache>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<TerrainMaterial>>,
@@ -245,7 +266,16 @@ fn setup(
     );
     let mut stage_cache = StageCache::default();
     let progress = AtomicU8::new(0);
-    let run = pipeline::run_pipeline(&gpu, &params.0, &mut stage_cache, &progress);
+    // Fast first frame: build a 512^2 preview synchronously (~0.4 s) and
+    // queue the configured-resolution build on the async path right away.
+    // Capture mode keeps the synchronous full-res build so the verification
+    // reference pixels are unaffected.
+    let mut startup_params = params.0.clone();
+    if std::env::var("TERRAFORGE_CAPTURE").is_err() && startup_params.base.grid > 512 {
+        startup_params.base.grid = 512;
+        regen.0 = true;
+    }
+    let run = pipeline::run_pipeline(&gpu, &startup_params, &mut stage_cache, &progress);
     cache.0 = Some(stage_cache);
     commands.insert_resource(GpuCompute(gpu));
     let stats = TerrainStats { h_min: run.h_min, h_max: run.h_max };
@@ -419,6 +449,8 @@ fn ui_panel(
     last_audit: Res<LastAudit>,
     stats: Option<Res<TerrainStats>>,
     capture: Option<Res<CaptureMode>>,
+    mut prefs: ResMut<UiPrefs>,
+    diagnostics: Res<DiagnosticsStore>,
 ) -> Result {
     // Verification captures must show pixels from the reference viewpoints
     // only — no UI chrome.
@@ -426,6 +458,21 @@ fn ui_panel(
         return Ok(());
     }
     let ctx = contexts.ctx_mut()?;
+    ctx.set_pixels_per_point(prefs.scale);
+    // Keyboard shortcuts (suppressed while a text field has focus).
+    let typing = ctx.wants_keyboard_input();
+    if !typing && ctx.input(|i| i.key_pressed(egui::Key::F1)) {
+        prefs.visible = !prefs.visible;
+    }
+    if !typing
+        && ctx.input(|i| i.key_pressed(egui::Key::R))
+        && regen_inflight.task.is_none()
+    {
+        regen.0 = true;
+    }
+    if !prefs.visible {
+        return Ok(());
+    }
     egui::SidePanel::left("terrain-controls")
         .default_width(290.0)
         .show(ctx, |ui| {
@@ -434,7 +481,8 @@ fn ui_panel(
 
             ui.collapsing("Generation (press Regenerate)", |ui| {
                 let p = &mut params.bypass_change_detection().0;
-                ui.add(egui::Slider::new(&mut p.base.seed, 0..=99_999).text("seed"));
+                ui.add(egui::Slider::new(&mut p.base.seed, 0..=99_999).text("seed"))
+                    .on_hover_text("Same seed + same params = bit-identical terrain");
                 ui.horizontal(|ui| {
                     if ui.button("🎲 random seed").clicked() {
                         p.base.seed = std::time::SystemTime::now()
@@ -461,9 +509,11 @@ fn ui_panel(
                 ui.label(format!(
                     "cell size: {:.1} m",
                     p.base.world_size / p.base.grid as f32 * METERS_PER_UNIT
-                ));
+                ))
+                .on_hover_text("Map size / grid — finer cells hold finer erosion detail");
                 ui.separator();
-                ui.add(egui::Slider::new(&mut p.base.amplitude, 2.0..=25.0).text("fBm amplitude"));
+                ui.add(egui::Slider::new(&mut p.base.amplitude, 2.0..=25.0).text("fBm amplitude"))
+                    .on_hover_text("Base noise relief in world units (1 unit = 20 m)");
                 ui.add(egui::Slider::new(&mut p.base.octaves, 1..=10).text("fBm octaves"));
                 ui.add(egui::Slider::new(&mut p.base.frequency, 0.5..=8.0).text("fBm frequency"));
                 ui.add(
@@ -489,7 +539,8 @@ fn ui_panel(
                     egui::Slider::new(&mut p.hydraulic.rain_rate, 0.002..=0.05)
                         .logarithmic(true)
                         .text("rain rate"),
-                );
+                )
+                .on_hover_text("Water per erosion step — more rain cuts deeper valleys");
                 ui.add(
                     egui::Slider::new(&mut p.hydraulic.capacity_k, 0.2..=2.0)
                         .text("sediment capacity"),
@@ -507,7 +558,8 @@ fn ui_panel(
                     egui::Slider::new(&mut p.hydrology.river_threshold, 0.0002..=0.01)
                         .logarithmic(true)
                         .text("river density"),
-                );
+                )
+                .on_hover_text("Low = dense river network, high = only the major rivers");
                 ui.add(
                     egui::Slider::new(&mut p.hydrology.carve_depth, 0.0..=1.0)
                         .text("river carve depth"),
@@ -545,9 +597,11 @@ fn ui_panel(
                 let mut changed = false;
                 changed |= ui
                     .add(egui::Slider::new(&mut v.sea_level_frac, 0.0..=0.4).text("sea level"))
+                    .on_hover_text("Ocean height as a fraction of the terrain's relief")
                     .changed();
                 changed |= ui
                     .add(egui::Slider::new(&mut v.snow_line, 0.3..=1.0).text("snow line"))
+                    .on_hover_text("Normalized elevation where snow appears on gentle slopes")
                     .changed();
                 changed |= ui
                     .add(
@@ -620,6 +674,17 @@ fn ui_panel(
                 }
             });
 
+            ui.separator();
+            ui.add(egui::Slider::new(&mut prefs.scale, 0.75..=2.0).text("UI scale"))
+                .on_hover_text("Accessibility: scales all panel text and widgets");
+            if let Some(fps) = diagnostics
+                .get(&FrameTimeDiagnosticsPlugin::FPS)
+                .and_then(|d| d.smoothed())
+            {
+                ui.label(format!("{fps:.0} fps"));
+            }
+            ui.label("R = regenerate · F1 = hide/show UI")
+                .on_hover_text("Shortcuts work whenever no text field is focused");
             if let Some(stats) = stats {
                 ui.separator();
                 ui.label(format!(

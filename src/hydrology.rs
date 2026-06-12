@@ -170,11 +170,11 @@ pub fn run_hydrology(hm: &Heightmap, s: &HydrologySettings) -> HydrologyOutput {
     // river cell, intensity scaled by log drainage (big rivers = deeper,
     // wider). `max` blending keeps confluences smooth.
     let mut strength = vec![0.0f32; n];
-    for i in 0..n {
-        if acc[i] < thr {
+    for (i, &a) in acc.iter().enumerate() {
+        if a < thr {
             continue;
         }
-        let t = ((acc[i].ln() - log_thr) / log_span).clamp(0.0, 1.0);
+        let t = ((a.ln() - log_thr) / log_span).clamp(0.0, 1.0);
         let radius = (1.0 + s.river_width * t).ceil() as i32;
         let x = (i % w) as i32;
         let z = (i / w) as i32;

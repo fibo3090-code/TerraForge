@@ -218,7 +218,7 @@ pub fn audit_biome_palette(stats: &[(Biome, TextureStats)]) -> AuditReport {
         }
     }
     AuditReport {
-        per_texture: stats.iter().cloned().collect(),
+        per_texture: stats.to_vec(),
         closest_pair: min_pair,
         closest_distance: min_dist,
     }

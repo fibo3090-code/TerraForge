@@ -504,7 +504,7 @@ pub fn erode_thermal(
             });
             pass.set_pipeline(&pipeline);
             for _ in 0..batch {
-                let bg = if step % 2 == 0 { &group_a } else { &group_b };
+                let bg = if step.is_multiple_of(2) { &group_a } else { &group_b };
                 pass.set_bind_group(0, bg, &[]);
                 pass.dispatch_workgroups(wg_x, wg_z, 1);
                 step += 1;
@@ -515,7 +515,7 @@ pub fn erode_thermal(
     }
 
     // After N iterations, the up-to-date buffer is A if N is even, else B.
-    let output_buf = if params.iterations % 2 == 0 { &buf_a } else { &buf_b };
+    let output_buf = if params.iterations.is_multiple_of(2) { &buf_a } else { &buf_b };
 
     // --- Read back ---------------------------------------------------------
     let staging = device.create_buffer(&wgpu::BufferDescriptor {
