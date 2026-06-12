@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::erosion::{self, GpuContext};
 use crate::heightmap::Heightmap;
+use crate::hydrology::{run_hydrology, HydrologySettings, WaterField};
 use crate::tectonics::{apply_tectonics, TectonicParams};
 use crate::terrain_noise::{generate_fbm, FbmParams};
 
@@ -54,6 +55,7 @@ pub struct PipelineParams {
     pub tectonics: TectonicSettings,
     pub hydraulic: HydraulicSettings,
     pub thermal: ThermalSettings,
+    pub hydrology: HydrologySettings,
 }
 
 impl Default for PipelineParams {
@@ -80,6 +82,7 @@ impl Default for PipelineParams {
                 total_dig_budget: 0.2,
             },
             thermal: ThermalSettings { talus_angle_deg: 35.0 },
+            hydrology: HydrologySettings::default(),
         }
     }
 }
@@ -91,6 +94,8 @@ pub struct StageCache {
     base: Option<(BaseParams, Heightmap)>,
     tectonics: Option<(BaseParams, TectonicSettings, Heightmap)>,
     hydraulic: Option<(BaseParams, TectonicSettings, HydraulicSettings, Heightmap)>,
+    thermal:
+        Option<(BaseParams, TectonicSettings, HydraulicSettings, ThermalSettings, Heightmap)>,
 }
 
 /// Progress stages written to the shared atomic during a run.
@@ -99,18 +104,23 @@ pub mod progress {
     pub const TECTONICS: u8 = 1;
     pub const HYDRAULIC: u8 = 2;
     pub const THERMAL: u8 = 3;
-    pub const MESH: u8 = 4;
-    pub const DONE: u8 = 5;
+    pub const HYDROLOGY: u8 = 4;
+    pub const MESH: u8 = 5;
+    pub const DONE: u8 = 6;
 
     pub fn label(stage: u8) -> &'static str {
-        ["fBm", "tectonics", "hydraulic", "thermal", "meshing", "done"]
+        ["fBm", "tectonics", "hydraulic", "thermal", "hydrology", "meshing", "done"]
             .get(stage as usize)
             .unwrap_or(&"…")
     }
 }
 
 pub struct PipelineRun {
+    /// Post-hydrology (river-carved) heightmap — the live terrain.
     pub heightmap: Heightmap,
+    pub water: WaterField,
+    pub river_cells: usize,
+    pub lake_cells: usize,
     pub h_min: f32,
     pub h_max: f32,
     /// Relief of the (possibly cached) tectonic stage — audit baseline.
@@ -226,27 +236,65 @@ pub fn run_pipeline(
         }
     };
 
-    // --- Stage 4: thermal erosion (never cached: it's the live output) ------
+    // --- Stage 4: thermal erosion --------------------------------------------
     progress.store(progress::THERMAL, Ordering::Relaxed);
-    let t = std::time::Instant::now();
-    let cell_size = p.base.world_size / p.base.grid as f32;
-    let max_drop = p.thermal.talus_angle_deg.to_radians().tan() * cell_size;
-    let hm = erosion::erode_thermal(
-        gpu,
-        &hydro_hm,
-        &erosion::ThermalParams {
-            iterations: TALUS_ITERATIONS,
-            max_drop,
-            damping: 0.5,
-        },
-    )
-    .expect("thermal erosion failed");
-    stages_run.push(("thermal", t.elapsed().as_secs_f32()));
+    let thermal_hm = match &cache.thermal {
+        Some((cb, ct, ch, cth, hm))
+            if *cb == p.base
+                && *ct == p.tectonics
+                && *ch == p.hydraulic
+                && *cth == p.thermal =>
+        {
+            reused.push("thermal");
+            hm.clone()
+        }
+        _ => {
+            let t = std::time::Instant::now();
+            let cell_size = p.base.world_size / p.base.grid as f32;
+            let max_drop = p.thermal.talus_angle_deg.to_radians().tan() * cell_size;
+            let hm = erosion::erode_thermal(
+                gpu,
+                &hydro_hm,
+                &erosion::ThermalParams {
+                    iterations: TALUS_ITERATIONS,
+                    max_drop,
+                    damping: 0.5,
+                },
+            )
+            .expect("thermal erosion failed");
+            stages_run.push(("thermal", t.elapsed().as_secs_f32()));
+            cache.thermal = Some((
+                p.base.clone(),
+                p.tectonics.clone(),
+                p.hydraulic.clone(),
+                p.thermal.clone(),
+                hm.clone(),
+            ));
+            hm
+        }
+    };
 
+    // --- Stage 5: hydrology (rivers + lakes; never cached: live output) -----
+    progress.store(progress::HYDROLOGY, Ordering::Relaxed);
+    let t = std::time::Instant::now();
+    let hydrology_out = run_hydrology(&thermal_hm, &p.hydrology);
+    stages_run.push(("hydrology", t.elapsed().as_secs_f32()));
+
+    let hm = hydrology_out.carved;
     let (h_min, h_max) = min_max(&hm);
     assert!(h_min.is_finite() && h_max.is_finite(), "pipeline produced NaN/Inf");
 
-    PipelineRun { heightmap: hm, h_min, h_max, tectonic_relief, stages_run, reused }
+    PipelineRun {
+        heightmap: hm,
+        water: hydrology_out.water,
+        river_cells: hydrology_out.river_cells,
+        lake_cells: hydrology_out.lake_cells,
+        h_min,
+        h_max,
+        tectonic_relief,
+        stages_run,
+        reused,
+    }
 }
 
 pub fn min_max(hm: &Heightmap) -> (f32, f32) {
@@ -280,6 +328,7 @@ mod tests {
             ("tectonics", Box::new(|p: &mut PipelineParams| p.tectonics.uplift_strength += 2.0)),
             ("hydraulic", Box::new(|p: &mut PipelineParams| p.hydraulic.rain_rate *= 1.5)),
             ("thermal", Box::new(|p: &mut PipelineParams| p.thermal.talus_angle_deg += 3.0)),
+            ("hydrology", Box::new(|p: &mut PipelineParams| p.hydrology.carve_depth += 0.1)),
         ];
         for (label, mutate) in mutations {
             let p1 = small_params();
@@ -297,7 +346,8 @@ mod tests {
         }
     }
 
-    /// A thermal-only change must reuse all three cached upstream stages.
+    /// A thermal-only change must reuse all three cached upstream stages
+    /// (hydrology always re-runs: it is the live output stage).
     #[test]
     fn thermal_change_reuses_upstream() {
         let gpu = ctx();
@@ -310,8 +360,24 @@ mod tests {
         p2.thermal.talus_angle_deg += 3.0;
         let second = run_pipeline(&gpu, &p2, &mut cache, &progress);
         assert_eq!(second.reused, vec!["fBm", "tectonics", "hydraulic"]);
-        assert_eq!(second.stages_run.len(), 1);
-        assert_eq!(second.stages_run[0].0, "thermal");
+        let ran: Vec<&str> = second.stages_run.iter().map(|(n, _)| *n).collect();
+        assert_eq!(ran, vec!["thermal", "hydrology"]);
+    }
+
+    /// A hydrology-only change must reuse all four cached upstream stages.
+    #[test]
+    fn hydrology_change_reuses_all_four() {
+        let gpu = ctx();
+        let progress = AtomicU8::new(0);
+        let p1 = small_params();
+        let mut cache = StageCache::default();
+        let _ = run_pipeline(&gpu, &p1, &mut cache, &progress);
+        let mut p2 = p1.clone();
+        p2.hydrology.river_threshold *= 2.0;
+        let second = run_pipeline(&gpu, &p2, &mut cache, &progress);
+        assert_eq!(second.reused, vec!["fBm", "tectonics", "hydraulic", "thermal"]);
+        let ran: Vec<&str> = second.stages_run.iter().map(|(n, _)| *n).collect();
+        assert_eq!(ran, vec!["hydrology"]);
     }
 
     /// world_size participates in the base fingerprint (it scales noise

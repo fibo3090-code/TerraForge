@@ -22,6 +22,7 @@ mod biome;
 mod erosion;
 mod export;
 mod heightmap;
+mod hydrology;
 mod mesh_builder;
 mod pipeline;
 mod talus;
@@ -30,6 +31,7 @@ mod terrain_noise;
 
 use biome::{build_terrain_material, BiomeParams, TerrainMaterial};
 use heightmap::Heightmap;
+use hydrology::WaterField;
 use mesh_builder::heightmap_to_mesh;
 use pipeline::{progress, PipelineParams, PipelineRun, StageCache, METERS_PER_UNIT};
 
@@ -100,6 +102,8 @@ struct TerrainHandles {
     material: Handle<TerrainMaterial>,
     water_mesh: Handle<Mesh>,
     water_material: Handle<StandardMaterial>,
+    /// Lake/river water-surface mesh (rebuilt every regen).
+    river_mesh: Handle<Mesh>,
 }
 
 #[derive(Resource, Default)]
@@ -134,6 +138,10 @@ struct LastAudit(Option<Result<(), String>>);
 /// The live post-pipeline heightmap (export source).
 #[derive(Resource)]
 struct CurrentHeightmap(Heightmap);
+
+/// The live water field (lake/river surface + depth) for export.
+#[derive(Resource)]
+struct CurrentWater(WaterField);
 
 #[derive(Resource, Default)]
 struct ExportInFlight {
@@ -246,7 +254,6 @@ fn setup(
     let world_size = params.0.base.world_size;
     let mesh = heightmap_to_mesh(&run.heightmap, world_size, HEIGHT_SCALE);
     let mesh_handle = meshes.add(mesh);
-    commands.insert_resource(CurrentHeightmap(run.heightmap));
 
     // Biome material reads the post-erosion height range so the elevation
     // smoothsteps line up with this seed's actual relief.
@@ -280,11 +287,22 @@ fn setup(
         NotShadowCaster,
         WaterPlane,
     ));
+    // Lake/river surface mesh from the hydrology water field.
+    let river_mesh_handle =
+        meshes.add(water_surface_mesh(&run.heightmap, &run.water, world_size));
+    commands.spawn((
+        Mesh3d(river_mesh_handle.clone()),
+        MeshMaterial3d(water_material_handle.clone()),
+        NotShadowCaster,
+    ));
+    commands.insert_resource(CurrentWater(run.water.clone()));
+    commands.insert_resource(CurrentHeightmap(run.heightmap));
     commands.insert_resource(TerrainHandles {
         mesh: mesh_handle,
         material: material_handle,
         water_mesh: water_mesh_handle,
         water_material: water_material_handle,
+        river_mesh: river_mesh_handle,
     });
 
     // Sun at physical illuminance — the atmosphere LUTs expect real-world
@@ -343,6 +361,26 @@ fn water_plane_mesh(world_size: f32) -> Mesh {
     Plane3d::default().mesh().size(world_size * 20.0, world_size * 20.0).into()
 }
 
+/// Lake/river surface mesh: wet cells sit at the water-surface elevation,
+/// dry cells are tucked just below the terrain so the surface hugs the
+/// shoreline. Downsampled to <=1024 per side — water is smooth.
+fn water_surface_mesh(terrain: &Heightmap, water: &WaterField, world_size: f32) -> Mesh {
+    let stride = (terrain.width / 1024).max(1);
+    let w = (terrain.width / stride).max(2);
+    let h = (terrain.height / stride).max(2);
+    let hm = Heightmap::from_fn(w, h, |x, z| {
+        let sx = (x * stride).min(terrain.width - 1);
+        let sz = (z * stride).min(terrain.height - 1);
+        let s = water.surface.get(sx, sz);
+        if s.is_finite() {
+            s
+        } else {
+            terrain.get(sx, sz) - 0.3
+        }
+    });
+    heightmap_to_mesh(&hm, world_size, HEIGHT_SCALE)
+}
+
 fn water_color(v: &VisualParams) -> Color {
     Color::srgba(v.water_color[0], v.water_color[1], v.water_color[2], 0.9)
 }
@@ -376,6 +414,7 @@ fn ui_panel(
     regen_inflight: Res<RegenInFlight>,
     mut export_inflight: ResMut<ExportInFlight>,
     current_hm: Option<Res<CurrentHeightmap>>,
+    current_water: Option<Res<CurrentWater>>,
     last_run: Res<LastRunInfo>,
     last_audit: Res<LastAudit>,
     stats: Option<Res<TerrainStats>>,
@@ -464,6 +503,20 @@ fn ui_panel(
                         .text("talus angle °"),
                 );
                 ui.separator();
+                ui.add(
+                    egui::Slider::new(&mut p.hydrology.river_threshold, 0.0002..=0.01)
+                        .logarithmic(true)
+                        .text("river density"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut p.hydrology.carve_depth, 0.0..=1.0)
+                        .text("river carve depth"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut p.hydrology.river_width, 0.0..=6.0)
+                        .text("river width"),
+                );
+                ui.separator();
                 if busy {
                     ui.horizontal(|ui| {
                         ui.spinner();
@@ -539,17 +592,19 @@ fn ui_panel(
                             rfd::FileDialog::new().set_title("Export folder").pick_folder()
                         {
                             let hm = hm.0.clone();
+                            let water = current_water.as_ref().map(|w| w.0.clone());
                             let p = params.0.clone();
                             let frac = visual.sea_level_frac;
                             export_inflight.task =
                                 Some(AsyncComputeTaskPool::get().spawn(async move {
-                                    export::export_all(&hm, &p, frac, &dir).map(|files| {
-                                        format!(
-                                            "exported {} files to {}",
-                                            files.len(),
-                                            dir.display()
-                                        )
-                                    })
+                                    export::export_all(&hm, &p, frac, water.as_ref(), &dir)
+                                        .map(|files| {
+                                            format!(
+                                                "exported {} files to {}",
+                                                files.len(),
+                                                dir.display()
+                                            )
+                                        })
                                 }));
                         }
                     }
@@ -680,6 +735,12 @@ fn poll_regen(
     meshes
         .insert(&handles.water_mesh, water_plane_mesh(world_size))
         .expect("water mesh handle is owned by TerrainHandles and never dropped");
+    meshes
+        .insert(
+            &handles.river_mesh,
+            water_surface_mesh(&output.run.heightmap, &output.run.water, world_size),
+        )
+        .expect("river mesh handle is owned by TerrainHandles and never dropped");
     if let Ok(e) = sun.single() {
         commands.entity(e).insert((
             sun_transform(visual.sun_azimuth_deg, visual.sun_elevation_deg, world_size),
@@ -707,18 +768,28 @@ fn poll_regen(
         .iter()
         .map(|(name, secs)| format!("{name} {secs:.2}s"))
         .collect();
-    last_run.0 = format!("{reused}{} · total {:.2}s", ran.join(", "), output.total_secs);
+    last_run.0 = format!(
+        "{reused}{} · total {:.2}s · {} river / {} lake cells",
+        ran.join(", "),
+        output.total_secs,
+        output.run.river_cells,
+        output.run.lake_cells,
+    );
     info!("regen: {}", last_run.0);
 
-    // Objective audit: cheap invariants on every regen.
+    // Objective audit: cheap invariants on every regen. Carved river
+    // channels are intentional steps, so the spike threshold must clear the
+    // carve depth.
     let cell_size = world_size / params.0.base.grid as f32;
     let max_drop = params.0.thermal.talus_angle_deg.to_radians().tan() * cell_size;
+    let spike_threshold = (2.0 * max_drop).max(params.0.hydrology.carve_depth * 1.2);
     last_audit.0 = Some(audit_heightmap(
         &output.run.heightmap,
         output.run.tectonic_relief,
-        max_drop,
+        spike_threshold,
     ));
 
+    commands.insert_resource(CurrentWater(output.run.water.clone()));
     commands.insert_resource(CurrentHeightmap(output.run.heightmap));
     cache.0 = Some(output.cache);
 }
@@ -731,11 +802,11 @@ fn poll_export(mut export_inflight: ResMut<ExportInFlight>) {
 }
 
 /// Post-regen invariant audit (objective check, shown in the panel).
-fn audit_heightmap(hm: &Heightmap, tectonic_relief: f32, max_drop: f32) -> Result<(), String> {
+fn audit_heightmap(hm: &Heightmap, tectonic_relief: f32, spike_threshold: f32) -> Result<(), String> {
     if !hm.data().iter().all(|v| v.is_finite()) {
         return Err("audit: non-finite heights".into());
     }
-    let spikes = analysis::spike_mask(hm, max_drop * 2.0).iter().filter(|&&b| b).count();
+    let spikes = analysis::spike_mask(hm, spike_threshold).iter().filter(|&&b| b).count();
     let pct = spikes as f32 / hm.data().len() as f32;
     if pct > 0.005 {
         return Err(format!("audit: spike density {:.2}% > 0.5%", pct * 100.0));

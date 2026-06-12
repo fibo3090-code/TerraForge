@@ -7,6 +7,7 @@ use std::path::Path;
 
 use crate::analysis::BiomeRules;
 use crate::heightmap::Heightmap;
+use crate::hydrology::WaterField;
 use crate::pipeline::{min_max, PipelineParams, METERS_PER_UNIT};
 
 /// 16-bit grayscale PNG, min–max normalized. Returns the (min, max) used so
@@ -59,23 +60,55 @@ pub fn write_biome_mask(hm: &Heightmap, rules: &BiomeRules, path: &Path) -> Resu
     crate::analysis::export_predicted_biome_png(hm, rules, path)
 }
 
-/// Water depth = max(0, sea_level - h), normalized over its own max.
-pub fn write_water_depth16(hm: &Heightmap, sea_level: f32, path: &Path) -> Result<(), String> {
-    let max_depth = hm
-        .data()
-        .iter()
-        .map(|&v| (sea_level - v).max(0.0))
-        .fold(0.0f32, f32::max)
-        .max(1e-6);
+/// Water depth normalized over its own max. With a hydrology `WaterField`
+/// the real lake/river depths are used; otherwise depth falls back to
+/// `max(0, sea_level - h)` (flat-ocean approximation).
+pub fn write_water_depth16(
+    hm: &Heightmap,
+    water: Option<&WaterField>,
+    sea_level: f32,
+    path: &Path,
+) -> Result<(), String> {
+    let depth_at = |x: usize, z: usize| -> f32 {
+        match water {
+            Some(w) => w.depth.get(x, z).max((sea_level - hm.get(x, z)).max(0.0)),
+            None => (sea_level - hm.get(x, z)).max(0.0),
+        }
+    };
+    let mut max_depth = 1e-6f32;
+    for z in 0..hm.height {
+        for x in 0..hm.width {
+            max_depth = max_depth.max(depth_at(x, z));
+        }
+    }
     let img = image::ImageBuffer::<image::Luma<u16>, Vec<u16>>::from_fn(
         hm.width as u32,
         hm.height as u32,
         |x, z| {
-            let d = (sea_level - hm.get(x as usize, z as usize)).max(0.0) / max_depth;
+            let d = depth_at(x as usize, z as usize) / max_depth;
             image::Luma([(d * 65535.0).round() as u16])
         },
     );
     img.save(path).map_err(|e| format!("water depth {}: {e}", path.display()))
+}
+
+/// Binary water mask: 255 where lake/river/ocean water is present.
+pub fn write_water_mask(
+    hm: &Heightmap,
+    water: &WaterField,
+    sea_level: f32,
+    path: &Path,
+) -> Result<(), String> {
+    let img = image::ImageBuffer::<image::Luma<u8>, Vec<u8>>::from_fn(
+        hm.width as u32,
+        hm.height as u32,
+        |x, z| {
+            let (x, z) = (x as usize, z as usize);
+            let wet = water.depth.get(x, z) > 0.0 || hm.get(x, z) < sea_level;
+            image::Luma([if wet { 255 } else { 0 }])
+        },
+    );
+    img.save(path).map_err(|e| format!("water mask {}: {e}", path.display()))
 }
 
 /// Scale + reproducibility sidecar.
@@ -108,23 +141,30 @@ pub fn export_all(
     hm: &Heightmap,
     params: &PipelineParams,
     sea_level_frac: f32,
+    water: Option<&WaterField>,
     dir: &Path,
 ) -> Result<Vec<String>, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     let (mn, mx) = min_max(hm);
     let sea_level = mn + sea_level_frac * (mx - mn);
     let rules = BiomeRules::from_heightmap(hm, 32.0);
-    let files: [(&str, Result<(), String>); 6] = [
+    let mut files: Vec<(&str, Result<(), String>)> = vec![
         ("height_16.png", write_png16(hm, &dir.join("height_16.png")).map(|_| ())),
         ("height.r16", write_r16(hm, &dir.join("height.r16")).map(|_| ())),
         ("height.exr", write_exr(hm, &dir.join("height.exr"))),
         ("biome_mask.png", write_biome_mask(hm, &rules, &dir.join("biome_mask.png"))),
         (
             "water_depth_16.png",
-            write_water_depth16(hm, sea_level, &dir.join("water_depth_16.png")),
+            write_water_depth16(hm, water, sea_level, &dir.join("water_depth_16.png")),
         ),
         ("metadata.json", write_metadata(hm, params, sea_level_frac, &dir.join("metadata.json"))),
     ];
+    if let Some(w) = water {
+        files.push((
+            "water_mask.png",
+            write_water_mask(hm, w, sea_level, &dir.join("water_mask.png")),
+        ));
+    }
     let mut written = Vec::new();
     for (name, result) in files {
         result?;
@@ -214,14 +254,35 @@ mod tests {
     }
 
     #[test]
-    fn export_all_writes_six_files() {
+    fn export_all_writes_six_files_without_water() {
         let hm = test_hm();
         let dir = tmp_dir("all");
         let files =
-            export_all(&hm, &crate::pipeline::PipelineParams::default(), 0.12, &dir).unwrap();
+            export_all(&hm, &crate::pipeline::PipelineParams::default(), 0.12, None, &dir)
+                .unwrap();
         assert_eq!(files.len(), 6);
         for f in &files {
             assert!(dir.join(f).is_file(), "{f} missing");
         }
+    }
+
+    #[test]
+    fn export_all_includes_water_mask_with_field() {
+        let hm = test_hm();
+        let out = crate::hydrology::run_hydrology(
+            &hm,
+            &crate::hydrology::HydrologySettings::default(),
+        );
+        let dir = tmp_dir("all-water");
+        let files = export_all(
+            &out.carved,
+            &crate::pipeline::PipelineParams::default(),
+            0.12,
+            Some(&out.water),
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(files.len(), 7);
+        assert!(dir.join("water_mask.png").is_file());
     }
 }
