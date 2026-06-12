@@ -17,6 +17,7 @@ mod biome;
 mod erosion;
 mod heightmap;
 mod mesh_builder;
+mod pipeline;
 mod talus;
 mod tectonics;
 mod terrain_noise;
