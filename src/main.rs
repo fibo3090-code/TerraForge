@@ -1,3 +1,6 @@
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
+
 use bevy::anti_alias::fxaa::Fxaa;
 use bevy::camera::Exposure;
 use bevy::core_pipeline::tonemapping::Tonemapping;
@@ -9,12 +12,15 @@ use bevy::pbr::{Atmosphere, AtmosphereSettings, MaterialPlugin, ScatteringMedium
 use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
+use bevy::tasks::futures_lite::future;
+use bevy::tasks::{block_on, AsyncComputeTaskPool, Task};
 use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 use bevy_panorbit_camera::{PanOrbitCamera, PanOrbitCameraPlugin};
 
 mod analysis;
 mod biome;
 mod erosion;
+mod export;
 mod heightmap;
 mod mesh_builder;
 mod pipeline;
@@ -25,62 +31,26 @@ mod terrain_noise;
 use biome::{build_terrain_material, BiomeParams, TerrainMaterial};
 use heightmap::Heightmap;
 use mesh_builder::heightmap_to_mesh;
-use tectonics::{apply_tectonics, TectonicParams};
-use terrain_noise::{generate_fbm, FbmParams};
+use pipeline::{progress, PipelineParams, PipelineRun, StageCache, METERS_PER_UNIT};
 
-const WORLD_SIZE: f32 = 100.0;
 const HEIGHT_SCALE: f32 = 1.0;
-const TALUS_ITERATIONS: u32 = 12;
 
 // ---------------------------------------------------------------------------
 // Parameters (edited live from the egui panel)
 // ---------------------------------------------------------------------------
-
-/// Parameters that require a full pipeline re-run (seconds). Applied when the
-/// user presses "Regenerate" in the panel.
-#[derive(Resource, Clone, PartialEq)]
-struct GenParams {
-    seed: u32,
-    /// Grid resolution per side. 512 regenerates in ~0.3 s for fast
-    /// iteration; 2048 is presentation quality (~4 s).
-    grid: usize,
-    /// fBm base amplitude in world units.
-    amplitude: f32,
-    /// Tectonic uplift peak height in world units.
-    uplift_strength: f32,
-    /// Ridge crest height in fully-uplifted zones.
-    ridge_strength: f32,
-    /// Target angle of repose for the thermal stage.
-    talus_angle_deg: f32,
-}
-
-impl Default for GenParams {
-    fn default() -> Self {
-        Self {
-            seed: 0,
-            grid: 2048,
-            amplitude: 10.0,
-            uplift_strength: 14.0,
-            ridge_strength: 16.0,
-            talus_angle_deg: 35.0,
-        }
-    }
-}
 
 /// Parameters that apply instantly (uniform / transform mutation only).
 #[derive(Resource, Clone, PartialEq)]
 struct VisualParams {
     /// Sea level as a fraction of the heightmap range above its minimum.
     sea_level_frac: f32,
-    /// Normalized elevation of the snow band centre.
     snow_line: f32,
-    /// Slope angle (degrees) past which terrain reads as rock.
     rock_slope_deg: f32,
-    /// Normalized elevation of the grass->dirt transition.
     grass_dirt_line: f32,
-    /// Sun spherical angles, degrees.
     sun_azimuth_deg: f32,
     sun_elevation_deg: f32,
+    water_color: [f32; 3],
+    water_roughness: f32,
 }
 
 impl Default for VisualParams {
@@ -90,9 +60,10 @@ impl Default for VisualParams {
             snow_line: 0.62,
             rock_slope_deg: 32.0,
             grass_dirt_line: 0.45,
-            // Matches the Phase 7 sun at (40, 120, 60).
             sun_azimuth_deg: 33.7,
             sun_elevation_deg: 59.0,
+            water_color: [0.08, 0.22, 0.32],
+            water_roughness: 0.08,
         }
     }
 }
@@ -101,9 +72,10 @@ impl Default for VisualParams {
 // Runtime state
 // ---------------------------------------------------------------------------
 
-/// The headless compute context survives regenerations.
+/// The headless compute context survives regenerations and is shared with
+/// background regen tasks.
 #[derive(Resource)]
-struct GpuCompute(erosion::GpuContext);
+struct GpuCompute(Arc<erosion::GpuContext>);
 
 #[derive(Resource, Clone, Copy)]
 struct TerrainStats {
@@ -120,20 +92,54 @@ impl TerrainStats {
     }
 }
 
-/// Asset handles that live across regenerations: the mesh asset is replaced
-/// in place, the material's uniform is mutated.
+/// Asset handles that live across regenerations: meshes are replaced in
+/// place, material uniforms are mutated.
 #[derive(Resource)]
 struct TerrainHandles {
     mesh: Handle<Mesh>,
     material: Handle<TerrainMaterial>,
+    water_mesh: Handle<Mesh>,
+    water_material: Handle<StandardMaterial>,
 }
 
 #[derive(Resource, Default)]
 struct RegenRequested(bool);
 
-/// Wall-clock duration of the last pipeline run, displayed in the panel.
+/// Stage cache, taken by the background task during a regen and restored on
+/// completion. `None` while a regen is in flight.
 #[derive(Resource, Default)]
-struct LastRegenSecs(f32);
+struct PipelineCache(Option<StageCache>);
+
+struct RegenOutput {
+    run: PipelineRun,
+    mesh: Mesh,
+    cache: StageCache,
+    total_secs: f32,
+}
+
+#[derive(Resource, Default)]
+struct RegenInFlight {
+    task: Option<Task<RegenOutput>>,
+    progress: Arc<AtomicU8>,
+}
+
+/// Panel feedback: which stages ran/reused last time + timings.
+#[derive(Resource, Default)]
+struct LastRunInfo(String);
+
+/// Post-regen invariant audit result for the panel.
+#[derive(Resource, Default)]
+struct LastAudit(Option<Result<(), String>>);
+
+/// The live post-pipeline heightmap (export source).
+#[derive(Resource)]
+struct CurrentHeightmap(Heightmap);
+
+#[derive(Resource, Default)]
+struct ExportInFlight {
+    task: Option<Task<Result<String, String>>>,
+    last_result: Option<Result<String, String>>,
+}
 
 #[derive(Component)]
 struct WaterPlane;
@@ -158,17 +164,21 @@ fn main() {
     // the background and AtmosphereEnvironmentMapLight supplies sky-bounce IBL.
     app.insert_resource(GlobalAmbientLight::NONE)
         .insert_resource(DirectionalLightShadowMap { size: 4096 })
-        .insert_resource(GenParams::default())
+        .insert_resource(PipelineParamsRes::default())
         .insert_resource(VisualParams::default())
         .insert_resource(RegenRequested::default())
-        .insert_resource(LastRegenSecs::default())
+        .insert_resource(PipelineCache::default())
+        .insert_resource(RegenInFlight::default())
+        .insert_resource(LastRunInfo::default())
+        .insert_resource(LastAudit::default())
+        .insert_resource(ExportInFlight::default())
         .add_plugins(DefaultPlugins)
         .add_plugins(EguiPlugin::default())
         .add_plugins(PanOrbitCameraPlugin)
         .add_plugins(MaterialPlugin::<TerrainMaterial>::default())
         .add_systems(Startup, setup)
         .add_systems(EguiPrimaryContextPass, ui_panel)
-        .add_systems(Update, (apply_visual_params, regenerate_terrain));
+        .add_systems(Update, (apply_visual_params, spawn_regen, poll_regen, poll_export));
 
     if let Ok(path) = std::env::var("TERRAFORGE_CAPTURE") {
         app.insert_resource(CaptureMode {
@@ -180,6 +190,10 @@ fn main() {
     }
     app.run();
 }
+
+/// Newtype so the egui panel can hold `PipelineParams` as a Bevy resource.
+#[derive(Resource, Default)]
+struct PipelineParamsRes(PipelineParams);
 
 /// Wait long enough for the material to compile + a few frames to settle,
 /// then take a screenshot and request app exit on the following frame.
@@ -202,84 +216,37 @@ fn capture_then_exit(
 }
 
 // ---------------------------------------------------------------------------
-// Generation pipeline
+// Setup
 // ---------------------------------------------------------------------------
-
-/// fBm base -> tectonic uplift + ridges -> GPU hydraulic erosion -> GPU
-/// thermal erosion. Returns the heightmap plus its min/max.
-fn run_pipeline(gpu: &erosion::GpuContext, p: &GenParams) -> (Heightmap, TerrainStats) {
-    let grid = p.grid;
-    let t_total = std::time::Instant::now();
-
-    let base = generate_fbm(
-        grid,
-        grid,
-        &FbmParams { seed: p.seed, amplitude: p.amplitude, ..Default::default() },
-    );
-    let hm = apply_tectonics(
-        &base,
-        &TectonicParams {
-            seed: p.seed,
-            uplift_strength: p.uplift_strength,
-            ridge_strength: p.ridge_strength,
-            ..Default::default()
-        },
-    );
-
-    // Linear erosion budget per cell side, same density at every resolution.
-    let erosion_iterations = (grid as u32 * 3) / 4;
-    let hm = erosion::erode_hydraulic(
-        gpu,
-        &hm,
-        &erosion::ErosionParams { iterations: erosion_iterations, ..Default::default() },
-    )
-    .expect("hydraulic erosion failed");
-
-    // Max permitted neighbour drop = tan(angle) * cell_size, so the visual
-    // angle of repose stays constant across grid resolutions.
-    let cell_size = WORLD_SIZE / grid as f32;
-    let max_drop = p.talus_angle_deg.to_radians().tan() * cell_size;
-    let hm = erosion::erode_thermal(
-        gpu,
-        &hm,
-        &erosion::ThermalParams { iterations: TALUS_ITERATIONS, max_drop, damping: 0.5 },
-    )
-    .expect("thermal erosion failed");
-
-    let (h_min, h_max) = hm
-        .data()
-        .iter()
-        .fold((f32::INFINITY, f32::NEG_INFINITY), |(mn, mx), &v| (mn.min(v), mx.max(v)));
-    assert!(h_min.is_finite() && h_max.is_finite(), "erosion produced NaN/Inf");
-    info!(
-        "pipeline: {grid}x{grid}, seed {}, {erosion_iterations} erosion iter, \
-         heights [{h_min:.2}, {h_max:.2}] in {:?}",
-        p.seed,
-        t_total.elapsed()
-    );
-
-    (hm, TerrainStats { h_min, h_max })
-}
 
 fn setup(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
-    gen_params: Res<GenParams>,
+    params: Res<PipelineParamsRes>,
     visual: Res<VisualParams>,
+    mut cache: ResMut<PipelineCache>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<TerrainMaterial>>,
     mut std_materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut scattering_mediums: ResMut<Assets<ScatteringMedium>>,
 ) {
-    let gpu = erosion::GpuContext::new()
-        .expect("GPU compute unavailable - hydraulic erosion requires a wgpu adapter");
-    let (hm, stats) = run_pipeline(&gpu, &gen_params);
+    let gpu = Arc::new(
+        erosion::GpuContext::new()
+            .expect("GPU compute unavailable - hydraulic erosion requires a wgpu adapter"),
+    );
+    let mut stage_cache = StageCache::default();
+    let progress = AtomicU8::new(0);
+    let run = pipeline::run_pipeline(&gpu, &params.0, &mut stage_cache, &progress);
+    cache.0 = Some(stage_cache);
     commands.insert_resource(GpuCompute(gpu));
+    let stats = TerrainStats { h_min: run.h_min, h_max: run.h_max };
     commands.insert_resource(stats);
 
-    let mesh = heightmap_to_mesh(&hm, WORLD_SIZE, HEIGHT_SCALE);
+    let world_size = params.0.base.world_size;
+    let mesh = heightmap_to_mesh(&run.heightmap, world_size, HEIGHT_SCALE);
     let mesh_handle = meshes.add(mesh);
+    commands.insert_resource(CurrentHeightmap(run.heightmap));
 
     // Biome material reads the post-erosion height range so the elevation
     // smoothsteps line up with this seed's actual relief.
@@ -293,30 +260,32 @@ fn setup(
     };
     let material_handle =
         build_terrain_material(&asset_server, &mut materials, &mut images, biome_params);
-    commands.insert_resource(TerrainHandles {
-        mesh: mesh_handle.clone(),
-        material: material_handle.clone(),
-    });
-    commands.spawn((Mesh3d(mesh_handle), MeshMaterial3d(material_handle)));
+    commands.spawn((Mesh3d(mesh_handle.clone()), MeshMaterial3d(material_handle.clone())));
 
-    // Water plane: floods the lowest valleys. Sea level derives from the
-    // heightmap stats so erosion re-tuning never strands it.
+    // Water plane: floods the lowest valleys; sea level derives from stats.
     let water_level = stats.water_level(visual.sea_level_frac);
+    let water_mesh_handle = meshes.add(water_plane_mesh(world_size));
+    let water_material_handle = std_materials.add(StandardMaterial {
+        base_color: water_color(&visual),
+        perceptual_roughness: visual.water_roughness,
+        metallic: 0.0,
+        reflectance: 0.4,
+        alpha_mode: AlphaMode::Blend,
+        ..default()
+    });
     commands.spawn((
-        // 20x the terrain so the plane's edge stays beyond the horizon.
-        Mesh3d(meshes.add(Plane3d::default().mesh().size(WORLD_SIZE * 20.0, WORLD_SIZE * 20.0))),
-        MeshMaterial3d(std_materials.add(StandardMaterial {
-            base_color: Color::srgba(0.08, 0.22, 0.32, 0.9),
-            perceptual_roughness: 0.08,
-            metallic: 0.0,
-            reflectance: 0.4,
-            alpha_mode: AlphaMode::Blend,
-            ..default()
-        })),
+        Mesh3d(water_mesh_handle.clone()),
+        MeshMaterial3d(water_material_handle.clone()),
         Transform::from_xyz(0.0, water_level, 0.0),
         NotShadowCaster,
         WaterPlane,
     ));
+    commands.insert_resource(TerrainHandles {
+        mesh: mesh_handle,
+        material: material_handle,
+        water_mesh: water_mesh_handle,
+        water_material: water_material_handle,
+    });
 
     // Sun at physical illuminance — the atmosphere LUTs expect real-world
     // lux; the camera's Exposure brings it back to display range.
@@ -326,30 +295,28 @@ fn setup(
             shadows_enabled: true,
             ..default()
         },
-        sun_transform(visual.sun_azimuth_deg, visual.sun_elevation_deg),
-        CascadeShadowConfigBuilder {
-            num_cascades: 4,
-            first_cascade_far_bound: 30.0,
-            maximum_distance: 400.0,
-            ..default()
-        }
-        .build(),
+        sun_transform(visual.sun_azimuth_deg, visual.sun_elevation_deg, world_size),
+        shadow_config(world_size),
         Sun,
     ));
 
     // Capture viewpoints: "close" (default) frames a slope where texture
     // artifacts are loudest; "wide" frames the whole terrain + horizon.
     // Always capture BOTH when validating a visual change.
+    let scale = world_size / 100.0;
     let view = std::env::var("TERRAFORGE_CAPTURE_VIEW").unwrap_or_default();
     let (cam_pos, cam_target) = if std::env::var("TERRAFORGE_CAPTURE").is_ok() {
         if view == "wide" {
-            (Vec3::new(0.0, 55.0, 150.0), Vec3::new(0.0, 5.0, 0.0))
+            (Vec3::new(0.0, 55.0, 150.0) * scale, Vec3::new(0.0, 5.0 * scale, 0.0))
         } else {
             let mid = (stats.h_min + stats.h_max) * 0.5;
-            (Vec3::new(15.0, stats.h_max + 8.0, 15.0), Vec3::new(-25.0, mid, -25.0))
+            (
+                Vec3::new(15.0 * scale, stats.h_max + 8.0, 15.0 * scale),
+                Vec3::new(-25.0 * scale, mid, -25.0 * scale),
+            )
         }
     } else {
-        (Vec3::new(0.0, 70.0, 130.0), Vec3::ZERO)
+        (Vec3::new(0.0, 0.7 * world_size, 1.3 * world_size), Vec3::ZERO)
     };
     commands.spawn((
         Camera3d::default(),
@@ -357,7 +324,7 @@ fn setup(
         // reads the 100-unit terrain as a ~2 km massif: subtle haze on far
         // ridges without fogging the scene.
         Atmosphere::earthlike(scattering_mediums.add(ScatteringMedium::default())),
-        AtmosphereSettings { scene_units_to_m: 20.0, ..default() },
+        AtmosphereSettings { scene_units_to_m: METERS_PER_UNIT, ..default() },
         AtmosphereEnvironmentMapLight::default(),
         Exposure { ev100: 13.0 },
         Bloom::NATURAL,
@@ -366,16 +333,35 @@ fn setup(
         Msaa::Off,
         Fxaa::default(),
         Tonemapping::AcesFitted,
-        Transform::from_xyz(cam_pos.x, cam_pos.y, cam_pos.z).looking_at(cam_target, Vec3::Y),
+        Transform::from_translation(cam_pos).looking_at(cam_target, Vec3::Y),
         PanOrbitCamera::default(),
     ));
 }
 
-fn sun_transform(azimuth_deg: f32, elevation_deg: f32) -> Transform {
+fn water_plane_mesh(world_size: f32) -> Mesh {
+    // 20x the terrain so the plane's edge stays beyond the horizon.
+    Plane3d::default().mesh().size(world_size * 20.0, world_size * 20.0).into()
+}
+
+fn water_color(v: &VisualParams) -> Color {
+    Color::srgba(v.water_color[0], v.water_color[1], v.water_color[2], 0.9)
+}
+
+fn sun_transform(azimuth_deg: f32, elevation_deg: f32, world_size: f32) -> Transform {
     let az = azimuth_deg.to_radians();
     let el = elevation_deg.to_radians();
     let dir = Vec3::new(el.cos() * az.sin(), el.sin(), el.cos() * az.cos());
-    Transform::from_translation(dir * 200.0).looking_at(Vec3::ZERO, Vec3::Y)
+    Transform::from_translation(dir * 2.0 * world_size).looking_at(Vec3::ZERO, Vec3::Y)
+}
+
+fn shadow_config(world_size: f32) -> bevy::light::CascadeShadowConfig {
+    CascadeShadowConfigBuilder {
+        num_cascades: 4,
+        first_cascade_far_bound: 0.3 * world_size,
+        maximum_distance: 4.0 * world_size,
+        ..default()
+    }
+    .build()
 }
 
 // ---------------------------------------------------------------------------
@@ -384,10 +370,14 @@ fn sun_transform(azimuth_deg: f32, elevation_deg: f32) -> Transform {
 
 fn ui_panel(
     mut contexts: EguiContexts,
-    mut gen_params: ResMut<GenParams>,
+    mut params: ResMut<PipelineParamsRes>,
     mut visual: ResMut<VisualParams>,
     mut regen: ResMut<RegenRequested>,
-    last_regen: Res<LastRegenSecs>,
+    regen_inflight: Res<RegenInFlight>,
+    mut export_inflight: ResMut<ExportInFlight>,
+    current_hm: Option<Res<CurrentHeightmap>>,
+    last_run: Res<LastRunInfo>,
+    last_audit: Res<LastAudit>,
     stats: Option<Res<TerrainStats>>,
     capture: Option<Res<CaptureMode>>,
 ) -> Result {
@@ -398,33 +388,102 @@ fn ui_panel(
     }
     let ctx = contexts.ctx_mut()?;
     egui::SidePanel::left("terrain-controls")
-        .default_width(270.0)
+        .default_width(290.0)
         .show(ctx, |ui| {
             ui.heading("Terrain");
+            let busy = regen_inflight.task.is_some();
 
             ui.collapsing("Generation (press Regenerate)", |ui| {
-                // bypass_change_detection: sliders write through ResMut every
-                // frame they're touched; only the Regenerate button should
-                // trigger the expensive path.
-                let p = gen_params.bypass_change_detection();
-                ui.add(egui::Slider::new(&mut p.seed, 0..=9999).text("seed"));
+                let p = &mut params.bypass_change_detection().0;
+                ui.add(egui::Slider::new(&mut p.base.seed, 0..=99_999).text("seed"));
+                ui.horizontal(|ui| {
+                    if ui.button("🎲 random seed").clicked() {
+                        p.base.seed = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .subsec_nanos()
+                            % 100_000;
+                        regen.0 = true;
+                    }
+                });
                 ui.horizontal(|ui| {
                     ui.label("grid");
                     for g in [512usize, 1024, 2048] {
-                        ui.selectable_value(&mut p.grid, g, g.to_string());
+                        ui.selectable_value(&mut p.base.grid, g, g.to_string());
                     }
                 });
-                ui.add(egui::Slider::new(&mut p.amplitude, 2.0..=25.0).text("fBm amplitude"));
-                ui.add(egui::Slider::new(&mut p.uplift_strength, 0.0..=30.0).text("uplift"));
-                ui.add(egui::Slider::new(&mut p.ridge_strength, 0.0..=30.0).text("ridges"));
                 ui.add(
-                    egui::Slider::new(&mut p.talus_angle_deg, 25.0..=45.0).text("talus angle °"),
+                    egui::Slider::new(&mut p.base.world_size, 50.0..=500.0)
+                        .text("map size")
+                        .custom_formatter(|v, _| {
+                            format!("{:.1} km", v as f32 * METERS_PER_UNIT / 1000.0)
+                        }),
                 );
-                if ui.button("Regenerate").clicked() {
+                ui.label(format!(
+                    "cell size: {:.1} m",
+                    p.base.world_size / p.base.grid as f32 * METERS_PER_UNIT
+                ));
+                ui.separator();
+                ui.add(egui::Slider::new(&mut p.base.amplitude, 2.0..=25.0).text("fBm amplitude"));
+                ui.add(egui::Slider::new(&mut p.base.octaves, 1..=10).text("fBm octaves"));
+                ui.add(egui::Slider::new(&mut p.base.frequency, 0.5..=8.0).text("fBm frequency"));
+                ui.add(
+                    egui::Slider::new(&mut p.base.persistence, 0.2..=0.8).text("fBm persistence"),
+                );
+                ui.separator();
+                ui.add(
+                    egui::Slider::new(&mut p.tectonics.uplift_strength, 0.0..=30.0).text("uplift"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut p.tectonics.ridge_strength, 0.0..=30.0).text("ridges"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut p.tectonics.uplift_frequency, 0.2..=4.0)
+                        .text("uplift frequency"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut p.tectonics.ridge_frequency, 0.5..=8.0)
+                        .text("ridge frequency"),
+                );
+                ui.separator();
+                ui.add(
+                    egui::Slider::new(&mut p.hydraulic.rain_rate, 0.002..=0.05)
+                        .logarithmic(true)
+                        .text("rain rate"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut p.hydraulic.capacity_k, 0.2..=2.0)
+                        .text("sediment capacity"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut p.hydraulic.total_dig_budget, 0.05..=0.5)
+                        .text("dig budget"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut p.thermal.talus_angle_deg, 25.0..=45.0)
+                        .text("talus angle °"),
+                );
+                ui.separator();
+                if busy {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        let stage = regen_inflight.progress.load(Ordering::Relaxed);
+                        ui.label(format!("running: {}", progress::label(stage)));
+                    });
+                } else if ui.button("Regenerate").clicked() {
                     regen.0 = true;
                 }
-                if last_regen.0 > 0.0 {
-                    ui.label(format!("last run: {:.2}s", last_regen.0));
+                if !last_run.0.is_empty() {
+                    ui.label(&last_run.0);
+                }
+                match &last_audit.0 {
+                    Some(Ok(())) => {
+                        ui.colored_label(egui::Color32::from_rgb(80, 200, 80), "✓ invariants ok");
+                    }
+                    Some(Err(msg)) => {
+                        ui.colored_label(egui::Color32::from_rgb(230, 80, 80), msg);
+                    }
+                    None => {}
                 }
             });
 
@@ -438,13 +497,17 @@ fn ui_panel(
                     .add(egui::Slider::new(&mut v.snow_line, 0.3..=1.0).text("snow line"))
                     .changed();
                 changed |= ui
-                    .add(egui::Slider::new(&mut v.rock_slope_deg, 15.0..=60.0).text("rock slope °"))
+                    .add(
+                        egui::Slider::new(&mut v.rock_slope_deg, 15.0..=60.0).text("rock slope °"),
+                    )
                     .changed();
                 changed |= ui
                     .add(egui::Slider::new(&mut v.grass_dirt_line, 0.0..=1.0).text("grass→dirt"))
                     .changed();
                 changed |= ui
-                    .add(egui::Slider::new(&mut v.sun_azimuth_deg, 0.0..=360.0).text("sun azimuth"))
+                    .add(
+                        egui::Slider::new(&mut v.sun_azimuth_deg, 0.0..=360.0).text("sun azimuth"),
+                    )
                     .changed();
                 changed |= ui
                     .add(
@@ -452,30 +515,78 @@ fn ui_panel(
                             .text("sun elevation"),
                     )
                     .changed();
+                ui.horizontal(|ui| {
+                    ui.label("water colour");
+                    changed |= ui.color_edit_button_rgb(&mut v.water_color).changed();
+                });
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut v.water_roughness, 0.02..=0.5)
+                            .text("water roughness"),
+                    )
+                    .changed();
                 if changed {
                     visual.set_changed();
+                }
+            });
+
+            ui.collapsing("Export", |ui| {
+                if export_inflight.task.is_some() {
+                    ui.spinner();
+                } else if ui.button("Export heightmap + masks…").clicked() {
+                    if let (Some(hm), false) = (current_hm.as_ref(), busy) {
+                        if let Some(dir) =
+                            rfd::FileDialog::new().set_title("Export folder").pick_folder()
+                        {
+                            let hm = hm.0.clone();
+                            let p = params.0.clone();
+                            let frac = visual.sea_level_frac;
+                            export_inflight.task =
+                                Some(AsyncComputeTaskPool::get().spawn(async move {
+                                    export::export_all(&hm, &p, frac, &dir).map(|files| {
+                                        format!(
+                                            "exported {} files to {}",
+                                            files.len(),
+                                            dir.display()
+                                        )
+                                    })
+                                }));
+                        }
+                    }
+                }
+                match &export_inflight.last_result {
+                    Some(Ok(msg)) => {
+                        ui.colored_label(egui::Color32::from_rgb(80, 200, 80), msg);
+                    }
+                    Some(Err(msg)) => {
+                        ui.colored_label(egui::Color32::from_rgb(230, 80, 80), msg);
+                    }
+                    None => {}
                 }
             });
 
             if let Some(stats) = stats {
                 ui.separator();
                 ui.label(format!(
-                    "heights [{:.1}, {:.1}], range {:.1}",
-                    stats.h_min, stats.h_max,
-                    stats.h_max - stats.h_min
+                    "heights [{:.1}, {:.1}] · range {:.1} ({:.0} m)",
+                    stats.h_min,
+                    stats.h_max,
+                    stats.range(),
+                    stats.range() * METERS_PER_UNIT,
                 ));
             }
         });
     Ok(())
 }
 
-/// Instant-apply path: water height, sun direction, biome thresholds. Runs
-/// only when a panel slider actually changed the resource.
+/// Instant-apply path: water height/colour, sun direction, biome thresholds.
 fn apply_visual_params(
     visual: Res<VisualParams>,
+    params: Res<PipelineParamsRes>,
     stats: Option<Res<TerrainStats>>,
     handles: Option<Res<TerrainHandles>>,
     mut materials: ResMut<Assets<TerrainMaterial>>,
+    mut std_materials: ResMut<Assets<StandardMaterial>>,
     mut water: Query<&mut Transform, (With<WaterPlane>, Without<Sun>)>,
     mut sun: Query<&mut Transform, (With<Sun>, Without<WaterPlane>)>,
 ) {
@@ -488,47 +599,93 @@ fn apply_visual_params(
         t.translation.y = stats.water_level(visual.sea_level_frac);
     }
     if let Ok(mut t) = sun.single_mut() {
-        *t = sun_transform(visual.sun_azimuth_deg, visual.sun_elevation_deg);
+        *t = sun_transform(
+            visual.sun_azimuth_deg,
+            visual.sun_elevation_deg,
+            params.0.base.world_size,
+        );
     }
     if let Some(mat) = materials.get_mut(&handles.material) {
         mat.extension.params.snow_line = visual.snow_line;
         mat.extension.params.rock_slope_cos = visual.rock_slope_deg.to_radians().cos();
         mat.extension.params.grass_dirt_line = visual.grass_dirt_line;
     }
+    if let Some(mat) = std_materials.get_mut(&handles.water_material) {
+        mat.base_color = water_color(&visual);
+        mat.perceptual_roughness = visual.water_roughness;
+    }
 }
 
-/// Expensive path: full pipeline re-run when the panel requested it. Replaces
-/// the mesh asset in place and refreshes the material's height range — the
-/// terrain entity itself never respawns. Blocks the frame for the duration
-/// (~0.3 s at 512², ~4 s at 2048²).
-fn regenerate_terrain(
+// ---------------------------------------------------------------------------
+// Async regeneration
+// ---------------------------------------------------------------------------
+
+fn spawn_regen(
     mut regen: ResMut<RegenRequested>,
-    gen_params: Res<GenParams>,
-    visual: Res<VisualParams>,
+    mut inflight: ResMut<RegenInFlight>,
+    mut cache: ResMut<PipelineCache>,
+    params: Res<PipelineParamsRes>,
     gpu: Option<Res<GpuCompute>>,
-    handles: Option<Res<TerrainHandles>>,
-    mut stats_res: Option<ResMut<TerrainStats>>,
-    mut last_regen: ResMut<LastRegenSecs>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<TerrainMaterial>>,
-    mut water: Query<&mut Transform, With<WaterPlane>>,
 ) {
-    if !regen.0 {
+    if !regen.0 || inflight.task.is_some() {
         return;
     }
     regen.0 = false;
-    let (Some(gpu), Some(handles), Some(stats_res)) = (gpu, handles, stats_res.as_deref_mut())
-    else {
-        return;
-    };
+    let Some(gpu) = gpu else { return };
+    // Cache is unavailable only if a previous task panicked mid-flight; a
+    // fresh (empty) cache is functionally identical, just slower.
+    let mut stage_cache = cache.0.take().unwrap_or_default();
+    let gpu = gpu.0.clone();
+    let p = params.0.clone();
+    let progress = inflight.progress.clone();
+    inflight.task = Some(AsyncComputeTaskPool::get().spawn(async move {
+        let t = std::time::Instant::now();
+        let run = pipeline::run_pipeline(&gpu, &p, &mut stage_cache, &progress);
+        progress.store(progress::MESH, Ordering::Relaxed);
+        let mesh = heightmap_to_mesh(&run.heightmap, p.base.world_size, HEIGHT_SCALE);
+        progress.store(progress::DONE, Ordering::Relaxed);
+        RegenOutput { run, mesh, cache: stage_cache, total_secs: t.elapsed().as_secs_f32() }
+    }));
+}
 
-    let t = std::time::Instant::now();
-    let (hm, stats) = run_pipeline(&gpu.0, &gen_params);
-    let mesh = heightmap_to_mesh(&hm, WORLD_SIZE, HEIGHT_SCALE);
-    meshes
-        .insert(&handles.mesh, mesh)
-        .expect("terrain mesh handle is owned by TerrainHandles and never dropped");
+fn poll_regen(
+    mut commands: Commands,
+    mut inflight: ResMut<RegenInFlight>,
+    mut cache: ResMut<PipelineCache>,
+    mut last_run: ResMut<LastRunInfo>,
+    mut last_audit: ResMut<LastAudit>,
+    params: Res<PipelineParamsRes>,
+    visual: Res<VisualParams>,
+    handles: Option<Res<TerrainHandles>>,
+    mut stats_res: Option<ResMut<TerrainStats>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<TerrainMaterial>>,
+    mut water: Query<&mut Transform, With<WaterPlane>>,
+    sun: Query<Entity, With<Sun>>,
+) {
+    let Some(task) = inflight.task.as_mut() else { return };
+    let Some(output) = block_on(future::poll_once(task)) else { return };
+    inflight.task = None;
+    let (Some(handles), Some(stats_res)) = (handles, stats_res.as_deref_mut()) else { return };
+
+    let stats = TerrainStats { h_min: output.run.h_min, h_max: output.run.h_max };
     *stats_res = stats;
+
+    meshes
+        .insert(&handles.mesh, output.mesh)
+        .expect("terrain mesh handle is owned by TerrainHandles and never dropped");
+    // World size may have changed: refresh the dependent water mesh, sun
+    // distance and shadow cascade extents.
+    let world_size = params.0.base.world_size;
+    meshes
+        .insert(&handles.water_mesh, water_plane_mesh(world_size))
+        .expect("water mesh handle is owned by TerrainHandles and never dropped");
+    if let Ok(e) = sun.single() {
+        commands.entity(e).insert((
+            sun_transform(visual.sun_azimuth_deg, visual.sun_elevation_deg, world_size),
+            shadow_config(world_size),
+        ));
+    }
 
     if let Some(mat) = materials.get_mut(&handles.material) {
         mat.extension.params.world_y_min = stats.h_min;
@@ -537,6 +694,58 @@ fn regenerate_terrain(
     if let Ok(mut t) = water.single_mut() {
         t.translation.y = stats.water_level(visual.sea_level_frac);
     }
-    last_regen.0 = t.elapsed().as_secs_f32();
-    info!("regenerated in {:.2}s", last_regen.0);
+
+    // Panel feedback: reuse + timing summary.
+    let reused = if output.run.reused.is_empty() {
+        String::new()
+    } else {
+        format!("reused {} · ", output.run.reused.join(", "))
+    };
+    let ran: Vec<String> = output
+        .run
+        .stages_run
+        .iter()
+        .map(|(name, secs)| format!("{name} {secs:.2}s"))
+        .collect();
+    last_run.0 = format!("{reused}{} · total {:.2}s", ran.join(", "), output.total_secs);
+    info!("regen: {}", last_run.0);
+
+    // Objective audit: cheap invariants on every regen.
+    let cell_size = world_size / params.0.base.grid as f32;
+    let max_drop = params.0.thermal.talus_angle_deg.to_radians().tan() * cell_size;
+    last_audit.0 = Some(audit_heightmap(
+        &output.run.heightmap,
+        output.run.tectonic_relief,
+        max_drop,
+    ));
+
+    commands.insert_resource(CurrentHeightmap(output.run.heightmap));
+    cache.0 = Some(output.cache);
+}
+
+fn poll_export(mut export_inflight: ResMut<ExportInFlight>) {
+    let Some(task) = export_inflight.task.as_mut() else { return };
+    let Some(result) = block_on(future::poll_once(task)) else { return };
+    export_inflight.task = None;
+    export_inflight.last_result = Some(result);
+}
+
+/// Post-regen invariant audit (objective check, shown in the panel).
+fn audit_heightmap(hm: &Heightmap, tectonic_relief: f32, max_drop: f32) -> Result<(), String> {
+    if !hm.data().iter().all(|v| v.is_finite()) {
+        return Err("audit: non-finite heights".into());
+    }
+    let spikes = analysis::spike_mask(hm, max_drop * 2.0).iter().filter(|&&b| b).count();
+    let pct = spikes as f32 / hm.data().len() as f32;
+    if pct > 0.005 {
+        return Err(format!("audit: spike density {:.2}% > 0.5%", pct * 100.0));
+    }
+    let (mn, mx) = pipeline::min_max(hm);
+    let relief = mx - mn;
+    if relief < 0.5 * tectonic_relief || relief > 1.2 * tectonic_relief {
+        return Err(format!(
+            "audit: relief {relief:.1} outside [50%,120%] of tectonic {tectonic_relief:.1}"
+        ));
+    }
+    Ok(())
 }
