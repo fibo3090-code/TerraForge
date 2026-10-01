@@ -7,8 +7,6 @@ networks, lakes at their natural spill levels, biome texturing by slope and
 altitude, and a physically-based sky — all editable live from an in-app panel
 and exportable to game engines and DCC tools.
 
-![pipeline](docs/superpowers/specs/2026-06-10-terrain-generator-design.md)
-
 ## Quick start
 
 Requirements: Rust (stable), a Vulkan-capable GPU, `cargo-nextest`
@@ -70,5 +68,5 @@ Quality is enforced by tooling, not vigilance — see [docs/QUALITY.md](docs/QUA
 
 ## Licences
 
-Code: project-internal. Biome textures: CC0 from [ambientCG](https://ambientcg.com)
+Code: MIT — see [LICENSE](LICENSE). Biome textures: CC0 from [ambientCG](https://ambientcg.com)
 (see `assets/biomes/README.md`).
