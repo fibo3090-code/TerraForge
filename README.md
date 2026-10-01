@@ -1,5 +1,11 @@
 # TerraForge
 
+> [!WARNING]
+> **Experimental project — for exploration only.** This repository is a personal
+> experiment, not a finished product. It may be incomplete or broken, and it is
+> not actively maintained. You are free to use, fork or adapt anything here under
+> the MIT licence, but review it carefully before relying on it.
+
 Real-time, fly-around 3D **realistic terrain generator** in Rust + Bevy 0.18. A
 five-stage simulation pipeline (fBm noise → tectonics → GPU hydraulic erosion →
 GPU thermal erosion → DEM hydrology) produces mountains carved by drainage
